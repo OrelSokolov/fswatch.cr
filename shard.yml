@@ -1,0 +1,13 @@
+name: fswatch
+version: 0.1.0
+description: |
+  Cross-platform filesystem watching for Crystal: a port & adapters
+  core with native event backends (Linux inotify, macOS/*BSD kqueue)
+  and a universal polling fallback. Inspired by fswatch/libfswatch;
+  a pure-Crystal implementation with no C dependency.
+
+authors:
+  - oleg
+
+license: MIT
+crystal: ">= 1.10.0"
