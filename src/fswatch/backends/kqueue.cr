@@ -16,29 +16,14 @@
 # This is the fundamental kqueue trade-off libfswatch documents too.
 
 {% if flag?(:darwin) || flag?(:freebsd) || flag?(:openbsd) || flag?(:netbsd) %}
-  @[Link("c")]
-  lib LibKEvent
-    fun kqueue = kqueue : Int32
-    fun kevent = kevent(kq : Int32, changelist : KEvent*, nchanges : Int32,
-                        eventlist : KEvent*, nevents : Int32,
-                        timeout : Timespec*) : Int32
-    fun kq_open = open(path : UInt8*, oflag : Int32, ...) : Int32
-    fun kq_close = close(fd : Int32) : Int32
-
-    struct KEvent
-      ident : UInt64  # uintptr_t — the fd for EVFILT_VNODE
-      filter : Int16  # EVFILT_VNODE
-      flags : UInt16  # EV_ADD/EV_DELETE/EV_CLEAR/EV_ERROR
-      fflags : UInt32 # NOTE_* bits
-      data : Int64
-      udata : Void*
-    end
-
-    struct Timespec
-      tv_sec : Int64
-      tv_nsec : Int64
-    end
-  end
+  # The stdlib already binds kqueue(2)/kevent(2) in LibC on every
+  # kqueue platform (lib_c/*/c/sys/event.cr, with Kevent/Timespec
+  # structs) — redeclaring them in a private lib is a hard Crystal
+  # "fun redefinition with different signature" error, so this
+  # backend rides LibC. The aliases paper over the Kevent/KEvent
+  # naming and keep the class's identifiers below unchanged.
+  alias KEvent = LibC::Kevent
+  alias KQTimespec = LibC::Timespec
 {% end %}
 
 module FSWatch
@@ -80,12 +65,12 @@ module FSWatch
       @skip : (String -> Bool)?
       @stopped = Atomic(Bool).new(false)
       # A zeroed timespec: kevent as a pure drain call.
-      @zero_timeout = LibKEvent::Timespec.new(tv_sec: 0, tv_nsec: 0)
+      @zero_timeout = KQTimespec.new(tv_sec: 0, tv_nsec: 0)
 
       def initialize(@recursive : Bool, interval : Time::Span? = nil,
                      skip : (String -> Bool)? = nil, &@emit : Event ->)
         @skip = skip
-        kq = LibKEvent.kqueue
+        kq = sys_kqueue
         raise IO::Error.new("kqueue(2) failed") if kq < 0
         @kq = kq
         io = IO::FileDescriptor.new(kq)
@@ -97,15 +82,15 @@ module FSWatch
 
       def add(path : String) : Nil
         return if @path_fds.has_key?(path)
-        fd = LibKEvent.kq_open(path, O_EVFLAG)
+        fd = sys_open(path)
         return if fd < 0
-        change = LibKEvent::KEvent.new
+        change = KEvent.new
         change.ident = fd.to_u64
         change.filter = EVFILT_VNODE
         change.flags = EV_ADD | EV_CLEAR
         change.fflags = NOTE_ALL
-        if LibKEvent.kevent(@kq, pointerof(change), 1, nil, 0, nil) < 0
-          LibKEvent.kq_close(fd)
+        if LibC.kevent(@kq, pointerof(change), 1, nil, 0, nil) < 0
+          sys_close(fd)
           return
         end
         @fd_paths[fd] = path
@@ -125,12 +110,12 @@ module FSWatch
       def remove(path : String) : Nil
         if (fd = @path_fds.delete(path))
           @fd_paths.delete(fd)
-          change = LibKEvent::KEvent.new
+          change = KEvent.new
           change.ident = fd.to_u64
           change.filter = EVFILT_VNODE
           change.flags = EV_DELETE
-          LibKEvent.kevent(@kq, pointerof(change), 1, nil, 0, nil)
-          LibKEvent.kq_close(fd)
+          LibC.kevent(@kq, pointerof(change), 1, nil, 0, nil)
+          sys_close(fd)
         end
         prefix = path.ends_with?(File::SEPARATOR) ? path : path + File::SEPARATOR
         @path_fds.keys.select(&.starts_with?(prefix)).each do |sub|
@@ -139,21 +124,26 @@ module FSWatch
       end
 
       def run : Nil
-        io = @kq_io
-        events = StaticArray(LibKEvent::KEvent, 64).new { LibKEvent::KEvent.new }
+        events = StaticArray(KEvent, 64).new { KEvent.new }
         loop do
           break if @stopped.get
-          # The kqueue fd is readable exactly when events are pending:
-          # sleep on the event loop (not the thread) until then.
-          io.wait_readable(STOP_CADENCE)
+          # Modern Crystal has no IO#wait_readable (the new event loops
+          # keep it event-loop-side), and kevent(2) with a timeout would
+          # block the whole single-threaded scheduler — so drain with a
+          # zero timeout at STOP_CADENCE and sleep between rounds: the
+          # poll backend's latency model (see the file header).
+          sleep STOP_CADENCE
           break if @stopped.get
-          n = LibKEvent.kevent(@kq, nil, 0, events.to_unsafe, events.size,
-            pointerof(@zero_timeout))
-          break if n < 0
-          events[0, n].each { |ev| dispatch(ev) }
+          loop do
+            n = LibC.kevent(@kq, nil, 0, events.to_unsafe, events.size,
+                            pointerof(@zero_timeout))
+            break if @stopped.get || n <= 0
+            n.times { |i| dispatch(events[i]) }
+            break if n < events.size # queue drained
+          end
         end
       ensure
-        @fd_paths.each_key { |fd| LibKEvent.kq_close(fd) }
+        @fd_paths.each_key { |fd| sys_close(fd) }
         @fd_paths.clear
         @path_fds.clear
         @kq_io.close unless @kq_io.closed?
@@ -165,7 +155,25 @@ module FSWatch
 
       # --- internals --------------------------------------------------
 
-      private def dispatch(ev : LibKEvent::KEvent) : Nil
+      # kqueue(2): darwin's LibC binds plain kqueue(), the BSDs bind
+      # kqueue1(flags); open(2)/close(2) are LibC's own everywhere.
+      private def sys_kqueue : Int32
+        {% if flag?(:darwin) %}
+          LibC.kqueue.to_i32
+        {% else %}
+          LibC.kqueue1(0)
+        {% end %}
+      end
+
+      private def sys_open(path : String) : Int32
+        LibC.open(path, O_EVFLAG).to_i32
+      end
+
+      private def sys_close(fd : Int32) : Nil
+        LibC.close(fd)
+      end
+
+      private def dispatch(ev : KEvent) : Nil
         return unless (path = @fd_paths[ev.ident.to_i32]?)
         fflags = ev.fflags
         return if fflags.zero? || (ev.flags & EV_ERROR) != 0
