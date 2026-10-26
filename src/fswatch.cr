@@ -31,6 +31,18 @@
 #   end
 #   # ... later:
 #   watch.stop
+#
+# `skip:` keeps a subtree off the watch tables entirely (no watch, no
+# descent, no events from it):
+#
+#   FSWatch.watch("proj", skip: ->(p : String) { p.includes?("/node_modules/") }) do |e|
+#     # ...
+#   end
+#
+# The watched ROOT is always armed synchronously; the recursive arming
+# of the tree beneath it runs on a fiber (inotify backend) — a huge
+# tree delays events for its deep pre-existing directories briefly,
+# never the caller.
 
 require "./fswatch/event"
 require "./fswatch/backend"
@@ -50,9 +62,14 @@ module FSWatch
   # recursively) and yield every change event to *handler*.
   #
   # `interval:` configures the Poll backend's tick (other backends
-  # ignore it). Returns a `Watch` handle; call `#stop` to tear down.
+  # ignore it). `skip:` receives every child directory the recursive
+  # arming is about to watch (absolute path); a true return drops the
+  # subtree — no watch, no descent, no events from it. Returns a
+  # `Watch` handle; call `#stop` to tear down.
   def self.watch(path : String, *, recursive : Bool = true,
-                 interval : Time::Span? = nil, &handler : Event ->) : Watch
-    Watch.new(path, recursive: recursive, interval: interval, &handler)
+                 interval : Time::Span? = nil,
+                 skip : (String -> Bool)? = nil,
+                 &handler : Event ->) : Watch
+    Watch.new(path, recursive: recursive, interval: interval, skip: skip, &handler)
   end
 end

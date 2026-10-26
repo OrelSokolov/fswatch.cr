@@ -77,12 +77,14 @@ module FSWatch
       @kq_io : IO::FileDescriptor
       @fd_paths = {} of Int32 => String
       @path_fds = {} of String => Int32
+      @skip : (String -> Bool)?
       @stopped = Atomic(Bool).new(false)
       # A zeroed timespec: kevent as a pure drain call.
       @zero_timeout = LibKEvent::Timespec.new(tv_sec: 0, tv_nsec: 0)
 
       def initialize(@recursive : Bool, interval : Time::Span? = nil,
-                     &@emit : Event ->)
+                     skip : (String -> Bool)? = nil, &@emit : Event ->)
+        @skip = skip
         kq = LibKEvent.kqueue
         raise IO::Error.new("kqueue(2) failed") if kq < 0
         @kq = kq
@@ -112,7 +114,9 @@ module FSWatch
         return unless directory?(path)
         begin
           Dir.each_child(path) do |name|
-            add(File.join(path, name)) if directory?(File.join(path, name))
+            child = File.join(path, name)
+            next if @skip.try &.call(child)
+            add(child) if directory?(child)
           end
         rescue File::NotFoundError | File::AccessDeniedError
         end
@@ -191,6 +195,7 @@ module FSWatch
         begin
           Dir.each_child(path) do |name|
             child = File.join(path, name)
+            next if @skip.try &.call(child)
             add(child) unless @path_fds.has_key?(child)
           end
         rescue File::NotFoundError | File::AccessDeniedError

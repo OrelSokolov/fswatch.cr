@@ -2,11 +2,16 @@
 # (no shard, no C shim). One inotify fd for the whole backend; the
 # observation fiber evented-reads it (epoll) and decodes records.
 #
-# Recursion: inotify is not recursive, so `add` walks the tree adding
-# a watch per directory, and Created/MovedTo + IsDir events add
-# watches for directories that appear later. Known inotify race
-# (documented by libfswatch too): children born between a
-# directory's creation and the watch being armed are not reported.
+# Recursion: inotify is not recursive, so the tree gets a watch per
+# directory. `add` arms the ROOT synchronously (one cheap add_watch —
+# the watched path is live when it returns) and walks the tree on a
+# separate arming FIBER, yielding every YIELD_EVERY directories: a
+# host's calling fiber (often the UI) must not block on a huge tree,
+# and a walk that never yields would starve the whole scheduler.
+# Created/MovedTo + IsDir events add watches for directories that
+# appear later. Known inotify race (documented by libfswatch too):
+# children born between a directory's creation and the watch being
+# armed are not reported.
 
 {% if flag?(:linux) %}
   @[Link("c")]
@@ -47,10 +52,12 @@ module FSWatch
       @io : IO::FileDescriptor
       @wd_paths = {} of Int32 => String
       @path_wds = {} of String => Int32
+      @skip : (String -> Bool)?
       @stopped = Atomic(Bool).new(false)
 
       def initialize(@recursive : Bool, interval : Time::Span? = nil,
-                     &@emit : Event ->)
+                     skip : (String -> Bool)? = nil, &@emit : Event ->)
+        @skip = skip
         fd = LibInotify.init1(IN_NONBLOCK | IN_CLOEXEC)
         raise IO::Error.new("inotify_init1(2) failed") if fd < 0
         io = IO::FileDescriptor.new(fd)
@@ -64,7 +71,12 @@ module FSWatch
       end
 
       def add(path : String) : Nil
-        arm(path, report: false)
+        # The root is LIVE from here (the specs' and hosts' contract:
+        # events directly under it arrive immediately); only the
+        # descent is deferred — see the file header.
+        arm_one(path)
+        return unless @recursive
+        spawn(name: "fswatch-inotify-arm") { descend(path, report: false) }
       end
 
       # A directory discovered at RUNTIME (a Created/MovedTo event):
@@ -73,21 +85,46 @@ module FSWatch
       # born between the mkdir and the arming get no kernel event;
       # e.g. a rapid mkdir -p a/b/c burst). Rare duplicates with
       # kernel events are possible; a missing file is worse than a
-      # repeated one (the trade-off libfswatch documents too).
+      # repeated one (the trade-off libfswatch documents too). Runs
+      # on the observation fiber; descend's yields keep a huge
+      # subtree from wedging event delivery. The skip filter applies
+      # to the discovered directory itself too — a runtime
+      # `mkdir node_modules` must not arm the whole vendored tree.
       private def add_discovered(path : String) : Nil
-        arm(path, report: true)
+        return if @skip.try &.call(path)
+        arm_one(path)
+        descend(path, report: true) if @recursive
       end
 
-      private def arm(path : String, report : Bool) : Nil
-        return if @path_wds.has_key?(path)
+      # One watch on *path* — idempotent (false when it was already
+      # armed or could not be).
+      private def arm_one(path : String) : Bool
+        return false if @path_wds.has_key?(path)
         wd = LibInotify.add_watch(@io.fd, path, WATCH_MASK)
-        return if wd < 0 # permissions, watch-table full, vanished
+        return false if wd < 0 # permissions, watch-table full, vanished
         @wd_paths[wd] = path
         @path_wds[path] = wd
-        return unless @recursive
-        return unless directory?(path)
+        true
+      end
+
+      # Directories the descent arms between Fiber.yields: the walk
+      # must share the scheduler, but each yield is also the only
+      # point a concurrent #stop can land — the stop-check after
+      # every yield is what keeps arming from racing the fd teardown.
+      YIELD_EVERY = 64
+
+      # Depth-first arming of *path*'s subtree (the path itself is
+      # armed by the caller). `report` emits Created for the children
+      # the walk finds — add_discovered's race-closer. Yields every
+      # YIELD_EVERY directories so the scheduler (and #stop) can
+      # interleave; between yields the stop-check/add pair is atomic
+      # under cooperative scheduling, so no watch is ever added after
+      # a stop has been observed.
+      private def descend(path : String, report : Bool) : Nil
+        budget = YIELD_EVERY
         begin
           Dir.each_child(path) do |name|
+            return if @stopped.get
             child = File.join(path, name)
             dir = directory?(child)
             if report
@@ -95,7 +132,16 @@ module FSWatch
               flags |= Event::Flag::IsDir if dir
               emit Event.new(child, flags)
             end
-            arm(child, report) if dir
+            next unless dir
+            next if @skip.try &.call(child)
+            arm_one(child)
+            descend(child, report)
+            budget -= 1
+            if budget.zero?
+              budget = YIELD_EVERY
+              Fiber.yield
+              return if @stopped.get
+            end
           end
         rescue File::NotFoundError | File::AccessDeniedError
           # raced away or unreadable — the watch on the parent stands

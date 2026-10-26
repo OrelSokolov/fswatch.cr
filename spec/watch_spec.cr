@@ -64,4 +64,39 @@ describe FSWatch::Watch do
       events.size.should eq(count)
     end
   end
+
+  it "skips subtrees the skip filter rejects" do
+    with_temp_dir do |dir|
+      vendored = File.join(dir, "node_modules", "pkg")
+      Dir.mkdir_p(vendored)
+      hidden = File.join(dir, ".cache")
+      Dir.mkdir(hidden)
+      events = [] of FSWatch::Event
+      watch = FSWatch.watch(dir,
+        skip: ->(p : String) {
+          p.includes?("node_modules") || p.includes?("/.cache")
+        }) { |e| events << e }
+
+      # The root itself stays live despite the filter.
+      File.touch(File.join(dir, "top.txt"))
+      eventually("top-level event never arrived") do
+        events.any? { |e| e.path.ends_with?("top.txt") && e.created? }
+      end
+
+      # Skipped subtrees never raise events (bounded wait, then
+      # silence is the assertion — nothing positive can arrive):
+      # pre-existing ones AND one materializing at runtime (its
+      # Created event on the armed root must not arm it).
+      File.touch(File.join(vendored, "v.txt"))
+      File.touch(File.join(hidden, "h.txt"))
+      late = File.join(dir, "node_modules-late")
+      Dir.mkdir(late)
+      File.touch(File.join(late, "l.txt"))
+      sleep 0.4.seconds
+      events.any? { |e| e.path.ends_with?("v.txt") || e.path.ends_with?("h.txt") ||
+                         e.path.ends_with?("l.txt") }
+        .should be_false
+      watch.stop
+    end
+  end
 end

@@ -18,12 +18,14 @@ module FSWatch
     @interval : Time::Span
     @roots = [] of String
     @snapshot = {} of String => Snap
+    @skip : (String -> Bool)?
     @stopped = Atomic(Bool).new(false)
     @wake = Channel(Nil).new
 
     def initialize(@recursive : Bool, interval : Time::Span? = nil,
-                   &@emit : Event ->)
+                   skip : (String -> Bool)? = nil, &@emit : Event ->)
       @interval = interval || DEFAULT_INTERVAL
+      @skip = skip
     end
 
     def add(path : String) : Nil
@@ -74,15 +76,24 @@ module FSWatch
 
     # linfo (not info): a symlink is snapshotted as a leaf and never
     # descended — a symlink loop would otherwise grow the walk forever.
+    # Skip-filtered children are neither snapshotted nor descended.
     private def snap(path : String, current : Hash(String, Snap)) : Nil
       info = File.info?(path, follow_symlinks: false)
       return unless info
       dir = info.type.directory?
       current[path] = Snap.new(info.modification_time, dir)
       return unless @recursive && dir
+      budget = 256 # share the scheduler on huge trees
       begin
         Dir.each_child(path) do |name|
-          snap(File.join(path, name), current)
+          child = File.join(path, name)
+          next if @skip.try &.call(child)
+          snap(child, current)
+          budget -= 1
+          if budget.zero?
+            budget = 256
+            Fiber.yield
+          end
         end
       rescue File::NotFoundError | File::AccessDeniedError
         # raced away or unreadable — what we have is the snapshot

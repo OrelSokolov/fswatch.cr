@@ -1,6 +1,12 @@
 # fswatch.cr — the core: owns the user handler, picks the platform
 # backend at compile time, feeds it the root path and its observation
 # fiber, and gates delivery on `#stop`.
+#
+# `skip:` (optional) receives every CHILD directory the recursive
+# arming is about to watch (an absolute path); a true return drops it
+# — no watch, no descent, no events from that subtree. Hosts use it
+# to keep vendored noise (node_modules and friends) off the kernel
+# watch tables; changes there go unreported by design.
 
 module FSWatch
   class Watch
@@ -12,13 +18,19 @@ module FSWatch
     @stopped = Atomic(Bool).new(false)
 
     def initialize(path : String, *, recursive : Bool = true,
-                   interval : Time::Span? = nil, &handler : Event ->)
+                   interval : Time::Span? = nil,
+                   skip : (String -> Bool)? = nil,
+                   &handler : Event ->)
       @path = File.expand_path(path)
       @recursive = recursive
       @handler = handler
-      @backend = self.class.select_backend.new(@recursive, interval) do |event|
+      @backend = self.class.select_backend.new(@recursive, interval, skip) do |event|
         @handler.call(event) unless @stopped.get
       end
+      # The root itself is armed synchronously (one cheap add — the
+      # watched path is live the moment this returns); the recursive
+      # DESCENT is the backend's business and must never block the
+      # caller for long (see the inotify backend's arming fiber).
       @backend.add(@path)
       # The observation fiber — no OS thread, see the shard header.
       # The scheduler runs it as soon as the constructing fiber
